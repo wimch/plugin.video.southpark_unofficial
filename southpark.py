@@ -150,36 +150,12 @@ def _dk(obj, keys, default=None):
 	return obj
 
 def _load_data(lang, path):
+	# Episode data is bundled with the addon (resources/data/), so it is read
+	# straight from disk. No network dependency, works fully offline, and it
+	# updates whenever a new addon version is installed.
 	path = path.format(lang)
-	addon_data = None
-	if os.path.isfile(path):
-		try:
-			with open(path, "r") as fp:
-				addon_data = _json.load(fp, strict=False)
-			if "date" in addon_data:
-				if addon_data["date"] != None:
-					now   = datetime.datetime.now()
-					date  = _datetime(addon_data["date"])
-					delta = now - date
-					if (delta.seconds/3600) > 12:
-						addon_data = None
-				else:
-					addon_data = None
-			elif "seasons" not in addon_data or not isinstance(addon_data["seasons"], list):
-				addon_data = None
-		except Exception as e:
-			log_error(e)
-			addon_data = None
-
-	if addon_data == None:
-		url = "https://raw.githubusercontent.com/wargio/plugin.video.southpark_unofficial/addon-data/addon-data-{}.json".format(lang)
-		addon_data = _http_get(url, True)
-		addon_data["date"] = "{}".format(datetime.datetime.now()),
-
-		with open(path,'w') as output:
-			output.truncate()
-			_json.dump(addon_data, output)
-
+	with open(path, "r") as fp:
+		addon_data = _json.load(fp, strict=False)
 	return SP_Data(addon_data["seasons"], addon_data["created"])
 
 class SP_I18N(object):
@@ -225,7 +201,7 @@ class SP_Paths(object):
 		self.DEFAULT_FANART   = self.translate_path('special://home/addons/{0}/fanart.jpg'.format(addon_id))
 		self.DEFAULT_IMGDIR   = self.translate_path('special://home/addons/{0}/imgs/'.format(addon_id))
 		self.TEMPORARY_FOLDER = self.translate_path('special://temp/southpark')
-		self.PLUGIN_DATA      = self.translate_path('special://temp/southpark/data_{}.json')
+		self.PLUGIN_DATA      = self.translate_path('special://home/addons/{0}/resources/data/addon-data-{{}}.json'.format(addon_id))
 		if not os.path.isdir(self.TEMPORARY_FOLDER):
 			os.mkdir(self.TEMPORARY_FOLDER, 0o755)
 
@@ -393,28 +369,18 @@ class SouthParkAddon(object):
 	def play_episode(self, season, episode):
 		data = self.data.episode(int(season) - 1, int(episode) - 1)
 		self.notify("{0} {1}".format(self.i18n.WARNING_LOADING, _encode(data["title"])), WARNING_TIMEOUT_SHORT)
-		streams   = []
-		subtitles = []
+		streams = []
 		try:
 			for url in data["mediagen"]:
 				url = base64.b64decode(url.encode('ascii')).decode('ascii')
-				mediagen = _http_get(url, True)
-
-				subs = _dk(mediagen, ["package", "video", "item", 0, "transcript", 0, "typographic"], [])
-				subs = list(filter(lambda x: "format" in x and x["format"] == "vtt", subs))
-				if len(subs) > 0:
-					subtitles.append(subs[0]["src"])
-				else:
-					subtitles.append(None)
-
-				m3u8 = None
-				try:
-					m3u8 = _dk(mediagen, ["package", "video", "item", 0, "rendition", "src"], None)
-				except TypeError:
-					m3u8 = _dk(mediagen, ["package", "video", "item", 0, "rendition", 0, "src"], None)
-
+				# The topaz "mica" endpoint returns a ready-to-play HLS master
+				# playlist in stitchedstream.source. Audio and subtitle tracks
+				# are multiplexed into that manifest, so there is nothing extra
+				# to fetch here (Kodi picks them up from the m3u8 directly).
+				mica = _http_get(url, True)
+				m3u8 = _dk(mica, ["stitchedstream", "source"], None)
 				if m3u8 == None:
-					raise Exception("invalid m3u8")
+					raise Exception(_dk(mica, ["error", "errormessage"], "invalid m3u8"))
 				streams.append(m3u8)
 		except Exception as e:
 			streams = []
@@ -441,9 +407,6 @@ class SouthParkAddon(object):
 
 			playitem.setArt({'icon': data["image"], 'thumb': data["image"]})
 			playitem.setInfo('video', {'Title': title, 'Plot': data["details"]})
-
-			if subtitles[i] != None and show_subs:
-				playitem.setSubtitles([subtitles[i]])
 
 			if i == 0:
 				firstitem = playitem

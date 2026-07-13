@@ -1,3 +1,9 @@
+0.7.0
+- Fixed playback: migrated from the decommissioned media-utils.mtvnservices.com
+  streaming API to the current topaz.paramount.tech "mica" endpoint
+- Episode data (seasons 1-28) is now bundled with the addon instead of
+  downloaded, so there is no network/GitHub dependency and it works offline
+- North America[ES] now uses the Latin-American Spanish source (the old es site was removed)
 0.6.6
 - Added cover for season 24 and 26
 0.6.5
