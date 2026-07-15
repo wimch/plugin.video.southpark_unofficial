@@ -1,6 +1,8 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 import sys, os
+import io
+import re
 import json as _json
 import random
 import datetime
@@ -17,10 +19,11 @@ IS_PY3 = sys.version_info[0] > 2
 if IS_PY3:
 	from urllib.request import Request
 	from urllib.request import urlopen
-	from urllib.parse import unquote_plus
+	from urllib.parse import unquote_plus, urljoin
 else:
 	from urllib2 import Request, urlopen
 	from urllib import unquote_plus
+	from urlparse import urljoin
 
 KODI_VERSION_MAJOR = int(xbmc.getInfoLabel('System.BuildVersion')[0:2])
 
@@ -41,6 +44,9 @@ PLUGIN_MODE_CLEARCACHE  = "sp:clearcache"
 
 def log_debug(message):
 	xbmc.log("[sp.addon] {}".format(message), xbmc.LOGDEBUG)
+
+def log_info(message):
+	xbmc.log("[sp.addon] {}".format(message), xbmc.LOGINFO)
 
 def log_error(message):
 	xbmc.log("[sp.addon] {}".format(message), xbmc.LOGERROR)
@@ -92,6 +98,87 @@ def _http_get(url, json=False):
 	if json:
 		data = _json.loads(data, strict=False)
 	return data
+
+# Matches a WebVTT cue timing line, e.g. "00:00:09.409 --> 00:00:12.445"
+# (the hours field is optional per the WebVTT spec).
+_VTT_CUE_RE = re.compile(r'(?:\d\d:)?\d\d:\d\d\.\d\d\d\s*-->')
+
+def _m3u8_subtitle_playlist(master_text, master_url):
+	# Find the subtitle rendition inside an HLS master playlist and return its
+	# absolute URL. Prefer the DEFAULT track, otherwise fall back to the first.
+	default_uri = None
+	first_uri = None
+	for line in master_text.splitlines():
+		line = line.strip()
+		if not line.startswith('#EXT-X-MEDIA') or 'TYPE=SUBTITLES' not in line:
+			continue
+		match = re.search(r'URI="([^"]+)"', line)
+		if match == None:
+			continue
+		if first_uri == None:
+			first_uri = match.group(1)
+		if 'DEFAULT=YES' in line:
+			default_uri = match.group(1)
+			break
+	uri = default_uri if default_uri != None else first_uri
+	if uri == None:
+		return None
+	return urljoin(master_url, uri)
+
+def _m3u8_segments(playlist_text, playlist_url):
+	# Return the absolute URLs of every media segment listed in a playlist.
+	segments = []
+	for line in playlist_text.splitlines():
+		line = line.strip()
+		if line != "" and not line.startswith('#'):
+			segments.append(urljoin(playlist_url, line))
+	return segments
+
+def _download_all(urls):
+	# Fetch a list of URLs, keeping their order. The subtitle track is split
+	# into hundreds of tiny 4s segments, so download them concurrently to keep
+	# the wait short; a failed segment simply becomes None and is skipped.
+	results = [None] * len(urls)
+	try:
+		from concurrent.futures import ThreadPoolExecutor
+		with ThreadPoolExecutor(max_workers=16) as executor:
+			futures = dict((executor.submit(_http_get, url), i) for i, url in enumerate(urls))
+			for future in futures:
+				i = futures[future]
+				try:
+					results[i] = future.result()
+				except Exception as e:
+					log_error("subtitle segment failed: {0}".format(e))
+	except ImportError:
+		for i, url in enumerate(urls):
+			try:
+				results[i] = _http_get(url)
+			except Exception as e:
+				log_error("subtitle segment failed: {0}".format(e))
+	return results
+
+def _stitch_vtt(segment_texts):
+	# The HLS subtitle segments carry absolute program timestamps, and cues that
+	# straddle a segment boundary are repeated in both segments. So stitching is
+	# just concatenating the cue blocks in order while dropping exact duplicates.
+	seen = set()
+	cues = []
+	for text in segment_texts:
+		if text == None:
+			continue
+		for block in re.split(r'\r?\n[ \t]*\r?\n', text.strip()):
+			block = block.strip()
+			if block == "" or block.upper().startswith('WEBVTT'):
+				continue
+			if not _VTT_CUE_RE.search(block):
+				continue
+			if block in seen:
+				continue
+			seen.add(block)
+			cues.append(block)
+	if len(cues) < 1:
+		return None
+	return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
 
 def _decode_dictionary(string):
 	newd = {}
@@ -366,6 +453,58 @@ class SouthParkAddon(object):
 		xbmcplugin.endOfDirectory(self.phandle)
 
 
+	def build_subtitles(self, master_url, part):
+		# Download the WebVTT subtitle rendition referenced by the HLS master
+		# playlist, stitch its segments into one file and return its path
+		# (or None when there is no subtitle track or the download fails).
+		try:
+			master = _http_get(master_url)
+			playlist_url = _m3u8_subtitle_playlist(master, master_url)
+			if playlist_url == None:
+				log_info("no subtitle rendition found in the HLS master playlist")
+				return None
+			playlist = _http_get(playlist_url)
+			segments = _m3u8_segments(playlist, playlist_url)
+			if len(segments) < 1:
+				log_info("subtitle playlist has no segments")
+				return None
+			vtt = _stitch_vtt(_download_all(segments))
+			if vtt == None:
+				log_info("stitched {0} segments but produced no cues".format(len(segments)))
+				return None
+			path = os.path.join(self.paths.TEMPORARY_FOLDER, "subtitle-{0}.vtt".format(part))
+			with io.open(path, "w", encoding="utf-8") as fp:
+				fp.write(vtt if IS_PY3 else vtt.decode("utf-8"))
+			log_info("stitched {0} segments -> {1} ({2} bytes)".format(len(segments), path, len(vtt)))
+			return path
+		except Exception as e:
+			log_error("cannot build subtitles: {0}".format(e))
+			return None
+
+
+	def enable_subtitles(self, subtitle):
+		# The subtitle is already attached to the resolved item, but Kodi does
+		# not always turn it on by itself. Once playback has actually started
+		# (bounded, interruptible wait), force the track on.
+		player = xbmc.Player()
+		monitor = xbmc.Monitor()
+		waited = 0
+		while not player.isPlaying():
+			if monitor.waitForAbort(0.25) or waited >= 15000:
+				log_info("playback did not start; leaving subtitles to Kodi")
+				return
+			waited += 250
+		# let the stream settle so the subtitle is not dropped
+		if monitor.waitForAbort(1):
+			return
+		try:
+			player.setSubtitles(subtitle)
+			player.showSubtitles(True)
+			log_info("subtitles enabled")
+		except Exception as e:
+			log_error("cannot enable subtitles: {0}".format(e))
+
+
 	def play_episode(self, season, episode):
 		data = self.data.episode(int(season) - 1, int(episode) - 1)
 		self.notify("{0} {1}".format(self.i18n.WARNING_LOADING, _encode(data["title"])), WARNING_TIMEOUT_SHORT)
@@ -374,9 +513,7 @@ class SouthParkAddon(object):
 			for url in data["mediagen"]:
 				url = base64.b64decode(url.encode('ascii')).decode('ascii')
 				# The topaz "mica" endpoint returns a ready-to-play HLS master
-				# playlist in stitchedstream.source. Audio and subtitle tracks
-				# are multiplexed into that manifest, so there is nothing extra
-				# to fetch here (Kodi picks them up from the m3u8 directly).
+				# playlist in stitchedstream.source that Kodi plays directly.
 				mica = _http_get(url, True)
 				m3u8 = _dk(mica, ["stitchedstream", "source"], None)
 				if m3u8 == None:
@@ -398,7 +535,9 @@ class SouthParkAddon(object):
 			playlist.clear()
 
 		firstitem = None
+		firstsub = None
 		show_subs = self.options.show_subtitles()
+		log_info("play {0}x{1}, show subtitles: {2}".format(season, episode, show_subs))
 		for i in range(0, parts):
 			playitem = xbmcgui.ListItem(path=streams[i])
 			title = data["title"]
@@ -408,13 +547,23 @@ class SouthParkAddon(object):
 			playitem.setArt({'icon': data["image"], 'thumb': data["image"]})
 			playitem.setInfo('video', {'Title': title, 'Plot': data["details"]})
 
+			# Kodi's internal ffmpeg client plays the HLS master directly but
+			# does not surface the WebVTT subtitle rendition declared in the
+			# manifest, so fetch that track, stitch its segments into a single
+			# file and attach it to the item as an external subtitle.
+			if show_subs:
+				subtitle = self.build_subtitles(streams[i], i)
+				if subtitle != None:
+					playitem.setSubtitles([subtitle])
+					if i == 0:
+						firstsub = subtitle
+
 			if i == 0:
 				firstitem = playitem
 			if playlist != None:
 				playlist.add(url=streams[i], listitem=playitem, index=i)
 
 		player = xbmc.Player()
-		player.showSubtitles(show_subs)
 		if self.phandle == -1:
 			## this could be removed..
 			if playlist != None:
@@ -424,6 +573,11 @@ class SouthParkAddon(object):
 		else:
 			xbmcplugin.setResolvedUrl(handle=self.phandle, succeeded=True, listitem=firstitem)
 		xbmcplugin.endOfDirectory(self.phandle)
+
+		# The subtitle is attached to the item; make sure Kodi actually turns
+		# it on once playback has started.
+		if firstsub != None:
+			self.enable_subtitles(firstsub)
 
 
 	def handle(self):

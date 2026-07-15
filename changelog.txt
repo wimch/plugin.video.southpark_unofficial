@@ -4,6 +4,8 @@
 - Episode data (seasons 1-28) is now bundled with the addon instead of
   downloaded, so there is no network/GitHub dependency and it works offline
 - North America[ES] now uses the Latin-American Spanish source (the old es site was removed)
+- Subtitles: download the HLS WebVTT subtitle rendition and stitch its segments
+  into a single track, so closed captions work without inputstream.adaptive
 0.6.6
 - Added cover for season 24 and 26
 0.6.5
